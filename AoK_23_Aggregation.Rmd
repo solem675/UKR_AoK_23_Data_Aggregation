@@ -1,0 +1,293 @@
+---
+title: "MSNA AoK Aggregation"
+author: "HK"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(openxlsx)
+library(tidyverse)
+library(data.table)
+library(fauxnaif)
+
+source("C:\\Users\\hanna.kurovska\\OneDrive - World Food Programme\\Desktop\\RAM\\R\\functions.R")
+```
+
+Dataset and questionnaire
+
+```{r}
+ds <- read.xlsx("C:\\Users\\hanna.kurovska\\World Food Programme\\Ukraine Response_ Programme Team - RAM\\04 - Needs assessments\\AoK_2023\\05_Data_cleaning\\Dataset\\AoK_23_Dataset_clean_230911.xlsx")
+
+questions <- read.xlsx("C:\\Users\\hanna.kurovska\\OneDrive - World Food Programme\\Desktop\\RAM\\AoK\\2023\\Data_cleaning\\AoK_23_tool_draft_HK_1_clean.xlsx")
+```
+
+Spreadsheet with aggregation rules (priorities)
+
+```{r}
+aggr_rules <- read.xlsx("C:\\Users\\hanna.kurovska\\OneDrive - World Food Programme\\Desktop\\RAM\\AoK\\2023\\Aggregation\\Aggregation_rules (1).xlsx")
+```
+
+Removing "don't know" prior to calculating crosstabs (replacing with NA)
+
+Select one
+
+```{r}
+names(aggr_rules) <- make.unique(names(aggr_rules))
+dks <- aggr_rules |> 
+  filter(ignore_dk == 1) |>
+  select(indicator, var.x, option)
+
+dk_so <- dks |>
+  filter(var.x != "1") |>
+  select(var.x) |>
+  unlist() |>
+  as.vector()
+  
+  
+ds <- ds |> mutate(across(!starts_with("_"), ~na_if_in(., unique(dk_so))))
+```
+
+
+Select multiple
+
+If "dk" is selected, the whole sm variable is turned to NA
+
+```{r}
+dk_sm <- dks |>
+  filter(var.x == "1") |>
+  mutate(nam = paste0(indicator, "/", option)) |>
+  select(nam) |>
+  unlist() |>
+  as.vector()
+
+dk_sm_a <- dks |>
+  filter(var.x == "1") |>
+  mutate(nam = paste0(indicator, "/", option))
+
+for(var in dk_sm){
+  
+  dk_sm_g <- str_split(var, pattern = "\\/")[[1]][1]
+  dk_sm_g_vars <- names(ds)[grepl(paste0(dk_sm_g), names(ds))]
+  
+  for(i in 1:nrow(ds)){
+    if(ds[i, paste0(var)] == 1 | is.na(ds[i, paste0(var)])){
+       ds[i, dk_sm_g_vars] <- NA
+    }
+  }
+}
+```
+
+
+Getting settlement-level frequency tables for aggregation
+
+1. getting dependent vars for crosstabulation
+
+```{r}
+aggr_var <- "a_5_settlement"
+tech_vars <- c("start", "end", "date_survey", "device_id", "g_4_enumerator_comment", "interview_code", "instanceID")
+vars <- names(ds)
+vars <- vars[!str_starts(vars, "_")]
+vars <- setdiff(vars, c(aggr_var, tech_vars))
+```
+
+Crosstabs
+
+```{r}
+tabs <- get_crosstabs(ds = ds, ind_var = aggr_var, dep_vars = vars)
+```
+
+Removing overalls from frequency tables. Splitting tabs into SO and SM questions
+
+```{r}
+tabs_sm <- tabs |>
+  select(indicator, var, starts_with("prop_")) |>
+  select(!contains("Overall")) |>
+  filter(str_detect(indicator, "\\/"))
+
+names(tabs_sm) <- str_remove(names(tabs_sm), "prop_")
+
+
+tabs_so <- tabs |>
+  select(indicator, var, starts_with("prop_")) |>
+  select(!contains("Overall")) |>
+  filter(!str_detect(indicator, "\\/"))
+
+names(tabs_so) <- str_remove(names(tabs_so), "prop_")
+```
+
+
+
+### Multiple choices aggregation
+
+#### Aggregation rules
+
+"Selected" if >= the threshold (40%)
+
+```{r}
+threshold <- 0.4
+```
+
+```{r}
+# getting settlements names
+settlements <- names(tabs_sm)[grepl("UA", names(tabs_sm))]
+# comparing with threshold and getting the tabs with replaced values
+tabs_sm_aggr <- tabs_sm |>
+  mutate(across(all_of(settlements), ~ifelse(.>=threshold, 1, 0)))
+# NAs in tabs are 0s
+tabs_sm_aggr <- replace(tabs_sm_aggr, is.na(tabs_sm_aggr), 0)
+# filtering 1s (selected)
+tabs_sm_aggr <- tabs_sm_aggr |>
+  filter(var == 1) |>
+  select(-var)
+#transposing
+ds_sm_aggr <- transpose(tabs_sm_aggr)
+rownames(ds_sm_aggr) <- colnames(tabs_sm_aggr)
+ds_sm_aggr <- setNames(ds_sm_aggr, ds_sm_aggr[1,])
+ds_sm_aggr <- ds_sm_aggr[-1,]
+ds_sm_aggr <- tibble::rownames_to_column(ds_sm_aggr, "settlement")
+```
+
+### Select one questions aggregation
+
+#### Aggregation rules:
+
+for ordinal or quasi-ordinal scales: if 50%+ in one of options then this one, if there is no such option - average of priorities/severities of selected options is taken, and the option with this level of priority/severity is taken. 
+
+for nominal scales: prevaling option. If same %, then - "unknown"
+
+
+0. Joining the doc with scale type and priority lvls
+
+```{r}
+tabs_so_p <- tabs_so |> left_join(aggr_rules |> select(indicator, option, var.x, `Priority.(opposite.of.severity)`, scale), by = c("indicator", "var" = "var.x"))
+```
+
+
+1. Ordinal scales
+```{r}
+tabs_so_p_ord <- tabs_so_p |> filter(scale == "ordinal")
+
+ds_ord_aggr <- NULL
+
+for(sttl in settlements){
+
+  
+  temp_settl <- tabs_so_p_ord |>
+  select(indicator, var, !!sym(sttl), `Priority.(opposite.of.severity)`)
+# case 1 - 50+%
+case1 <- temp_settl |> 
+  group_by(indicator) |>
+  filter(!!sym(sttl) >= 0.5) |>
+  slice_max(`Priority.(opposite.of.severity)`)
+#case 2 - none of options is 50%+
+case2 <- temp_settl |> anti_join(case1, by="indicator")
+
+av <- case2 |> 
+  filter(!is.na(!!sym(sttl))) |>
+  filter(!is.na(`Priority.(opposite.of.severity)`)) |>
+  group_by(indicator) |>
+  summarise(mean_p = round(mean(`Priority.(opposite.of.severity)`)))
+# option with mean priority is taken
+case2 <- case2 |>
+  left_join(av) |>
+  filter(`Priority.(opposite.of.severity)` == mean_p)
+
+temp_aggr_ord <- plyr::rbind.fill(case1, case2)
+
+temp_aggr_ord <- temp_aggr_ord |> select(indicator, var)
+
+temp_aggr_ord_t <- temp_aggr_ord |>
+  pivot_wider(everything(), names_from = "indicator", values_from = "var")
+
+temp_aggr_ord_t <- temp_aggr_ord_t |>
+  mutate(settlement = paste0(sttl))
+
+ds_ord_aggr <- plyr::rbind.fill(ds_ord_aggr, temp_aggr_ord_t)
+}
+
+
+```
+Select one nominal scales
+
+if one is prevailing, take this, if not = "unknown"
+
+```{r}
+tabs_so_p_nom <- tabs_so_p |> filter(scale == "nominal")
+
+ds_nom_aggr <- NULL
+
+for(sttl in settlements){
+  #sttl <- settlements[2]
+  
+  temp_settl <- tabs_so_p_nom |>
+  select(indicator, var, !!sym(sttl))
+# max. % option
+case1 <- temp_settl |> 
+  group_by(indicator) |>
+  slice_max(!!sym(sttl))
+
+nchoi <- case1 |>
+  count()
+
+case <- left_join(case1, nchoi)
+
+case_1 <- case |>
+  filter(n == 1)
+# if more than one option in one question has max value - unknown
+case_2 <- case |>
+  anti_join(case_1) |>
+  group_by(indicator) |>
+  summarise(var = "unknown")
+
+temp_nom <- rbind(case_1, case_2) |> select(indicator, var)
+
+temp_aggr_nom_t <- temp_nom |>
+  pivot_wider(everything(), names_from = "indicator", values_from = "var")
+
+temp_aggr_nom_t <- temp_aggr_nom_t |>
+  mutate(settlement = paste0(sttl))
+
+ds_nom_aggr <- plyr::rbind.fill(ds_nom_aggr, temp_aggr_nom_t)
+}
+```
+
+Medians for numerics
+
+```{r}
+numerics <- questions |> filter(type == "integer") |>
+  select(name) |>
+  unlist() |>
+  as.vector()
+
+ds_meds <- ds |> 
+  group_by(a_5_settlement) |>
+  summarise(across(all_of(numerics), median, na.rm = T))
+
+# income variable, different currency, splitted by currency
+
+med_inc <- ds |>
+  group_by(a_5_settlement, b_41_a_income_currency) |>
+  summarise(med_inc = median(b_41_average_income, na.rm = T)) |>
+  pivot_wider(names_from = b_41_a_income_currency, values_from = med_inc, names_prefix = "median_income_")
+
+ds_meds <- ds_meds |>select(-b_41_average_income) |>
+  full_join(med_inc)
+  
+```
+Joining data
+```{r}
+ds_aggr <- full_join(ds_ord_aggr, ds_nom_aggr) |>
+  full_join(ds_sm_aggr) |>
+  full_join(ds_meds, by = c("settlement" = "a_5_settlement"))
+```
+Recording the dataset
+```{r}
+write.xlsx(ds_aggr, "AoK_23_aggregated_upd_230913.xlsx")
+write.xlsx(tabs, "settlement_tabs1.xlsx")
+```
+
